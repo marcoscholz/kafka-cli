@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `.github/workflows/ci.yml`: PR-time lint gate (`bash -n` + shellcheck) so failures land in the pull request, not on a published release.
+- `.github/workflows/ci.yml` + `test/ci.sh`: PR-time validation running bash syntax, shellcheck, trailing-whitespace, CRLF, executable-bit, smoke test (`--help` / `--version`), workflow-YAML validity, and gitleaks secret scan. All checks are reproducible locally via `./test/ci.sh`.
 
 ## [1.0.0] - 2026-04-22
 

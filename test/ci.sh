@@ -31,26 +31,33 @@ check_shellcheck() {
     shellcheck bin/kafka-cli
 }
 
+# git grep exits 0 on match, 1 on no-match, >1 on real error. Treat each
+# explicitly so a permission/IO failure doesn't look like "no match = green".
 check_whitespace() {
     step "trailing whitespace"
-    # Scope to every tracked file so newly-added dirs are covered automatically.
-    # -I skips binaries; -z / -0 handles spaces in paths.
-    local hits
-    hits=$(git ls-files -z | xargs -0 grep -HnIP ' +$' 2>/dev/null || true)
-    if [[ -n "$hits" ]]; then
+    local hits rc=0
+    # -I skips binaries; [[:blank:]] catches trailing tabs too.
+    hits=$(git grep -HnI -E '[[:blank:]]+$') || rc=$?
+    if (( rc == 0 )); then
         echo "::error::Trailing whitespace found:"
         echo "$hits"
+        return 1
+    elif (( rc != 1 )); then
+        echo "::error::git grep exited $rc during whitespace scan"
         return 1
     fi
 }
 
 check_crlf() {
     step "LF line endings only"
-    local hits
-    hits=$(git ls-files -z | xargs -0 grep -lI $'\r' 2>/dev/null || true)
-    if [[ -n "$hits" ]]; then
+    local hits rc=0
+    hits=$(git grep -lI $'\r') || rc=$?
+    if (( rc == 0 )); then
         echo "::error::CRLF line endings found in:"
         echo "$hits"
+        return 1
+    elif (( rc != 1 )); then
+        echo "::error::git grep exited $rc during CRLF scan"
         return 1
     fi
 }
@@ -77,6 +84,14 @@ check_smoke() {
 
 check_yaml() {
     step "workflow YAML validity"
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "::error::python3 not found — needed to validate workflow YAML"
+        return 1
+    fi
+    if ! python3 -c 'import yaml' 2>/dev/null; then
+        echo "::error::PyYAML not available — install with 'pip install pyyaml'"
+        return 1
+    fi
     python3 -c '
 import yaml, pathlib
 for p in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
@@ -114,7 +129,19 @@ run_all() {
 }
 
 usage() {
-    sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+    cat <<'EOF'
+test/ci.sh — PR-time validation. Runs locally AND in CI.
+
+Usage:
+  ./test/ci.sh              run every check (default)
+  ./test/ci.sh <check>      run one of:
+                                syntax shellcheck whitespace crlf
+                                exec-bit smoke yaml gitleaks
+  ./test/ci.sh --help       show this help
+
+In CI (CI=true), gitleaks downloads its own binary. Locally, the script
+uses any system gitleaks or skips with a notice.
+EOF
 }
 
 case "${1:-all}" in
