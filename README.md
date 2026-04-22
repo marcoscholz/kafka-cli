@@ -4,7 +4,7 @@ A thin bash wrapper around [kcat](https://github.com/edenhill/kcat) for reading 
 It adds Unix `tail` semantics on top of kcat plus a few quality-of-life features:
 
 ## Features
-- **`tail`-like reads** — read the last N messages and exit, or `-f` to keep following, just like `tail -f`.
+- **`tail`-like reads** — read the last N messages (total across all partitions) and exit, or `-f` to keep following, just like `tail -f`.
 - **Human-readable `--since`** — `"5 min ago"`, `"yesterday 09:00"`, or any `date -d` string instead of a millisecond epoch.
 - **SSH jump host via `--via`** — opens a SOCKS5 tunnel on the fly, no setup on the remote box.
 - **Environment-variable configuration** — set broker and jump host once, then invoke with just a topic.
