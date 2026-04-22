@@ -1,0 +1,108 @@
+# Attaches assets + verify-download snippet to a GitHub Release the moment
+# it's published from the UI (or via `gh release create`).
+#
+# Flow:
+#   1. You draft a release in the UI, pick/create tag v1.0.0, click Publish.
+#   2. GitHub fires `release: published`.
+#   3. This workflow:
+#        a. Checks out the tagged commit
+#        b. Lints bin/kafka-cli with shellcheck
+#        c. Computes SHA-256 of the script
+#        d. Uploads bin/kafka-cli and bin/kafka-cli.sha256 as release assets
+#        e. Updates the release notes:
+#             - if you left the body empty, it inserts the matching CHANGELOG
+#               section
+#             - if you wrote your own, it's preserved and the verify-download
+#               snippet is appended at the bottom
+#
+# If the workflow fails (e.g. shellcheck finds a regression), the release
+# already exists but has no assets — so it's worth wiring a PR-time
+# shellcheck check separately so you catch this before publishing.
+
+name: release
+
+on:
+  release:
+    types: [published]
+
+# Defence-in-depth: only run when the tag matches v*.*.*. The workflow
+# still publishes hashes on valid releases; arbitrary-tag releases are
+# ignored rather than producing empty or mis-targeted notes.
+
+permissions:
+  contents: write  # needed to upload assets and edit release notes
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: startsWith(github.event.release.tag_name, 'v')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Lint script
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck bin/kafka-cli
+
+      - name: Compute SHA-256
+        id: hash
+        run: |
+          cd bin
+          sha256sum kafka-cli > kafka-cli.sha256
+          echo "sum=$(cut -d' ' -f1 kafka-cli.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Build release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          SHA: ${{ steps.hash.outputs.sum }}
+        run: |
+          VERSION="${TAG#v}"
+
+          # If the user didn't write notes in the UI, seed them from CHANGELOG.
+          # `.body // ""` coerces a missing body (returned as JSON null) to an
+          # empty string so the branch below fires.
+          existing=$(gh release view "$TAG" --json body --jq '.body // ""')
+          if [[ -z "$existing" ]]; then
+              # Literal-string match via index() — avoids regex metachars in
+              # $VERSION (`.`, `*`) matching unintended sections.
+              awk -v header="## [$VERSION]" '
+                  index($0, header) == 1   { printing=1; next }
+                  printing && /^## \[/     { exit }
+                  printing                 { print }
+              ' CHANGELOG.md > release-notes.md
+
+              # Fail loudly if the CHANGELOG section is missing so we don't
+              # silently publish a release with only a hash block.
+              [[ -s release-notes.md ]] \
+                  || { echo "ERROR: CHANGELOG section for $VERSION not found." >&2; exit 1; }
+          else
+              printf '%s\n' "$existing" > release-notes.md
+          fi
+
+          # Always append the verify-download section with the real hash.
+          cat >> release-notes.md <<EOF
+
+          ---
+
+          ### Verify download
+
+          \`\`\`bash
+          sha256sum ~/.local/bin/kafka-cli
+          # expected: $SHA
+          \`\`\`
+          EOF
+
+      - name: Upload assets and update release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$TAG" \
+              bin/kafka-cli \
+              bin/kafka-cli.sha256 \
+              --clobber
+          gh release edit "$TAG" --notes-file release-notes.md

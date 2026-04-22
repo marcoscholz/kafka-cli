@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# kafka-cli — consume or produce Kafka messages from the CLI.
+# Home: https://github.com/marcoscholz/kafka-cli
+# Thin wrapper around kcat(1): https://github.com/edenhill/kcat
+#
+# Run `kafka-cli --help` for usage, or see docs/MANUAL.md for the full
+# walkthrough (SSH-jump / SOCKS proxy setup, --since caveats, troubleshooting).
+
+set -euo pipefail
+
+VERSION="1.0.0"
+DEFAULT_COUNT="10"
+DEFAULT_SOCKS_PORT="10808"
+
+# Mutable state — set by parse_args, consumed by build_kcat_args / run_via_tunnel.
+BROKER=""
+VIA=""
+SOCKS_PORT=""
+MODE="consume"
+SINCE=""
+COUNT=""
+FOLLOW=0
+FROM_BEGINNING=0
+JSON=0
+TOPIC=""
+KCAT_ARGS=()
+
+# Survive beyond run_via_tunnel — cleanup_tunnel reads these from the EXIT trap.
+SSH_PID=""
+PCHAIN_CONF=""
+
+usage() {
+    cat <<EOF
+kafka-cli — consume (default, Unix-tail semantics) or produce (--produce) Kafka messages
+Home: https://github.com/marcoscholz/kafka-cli
+
+Usage: kafka-cli [options] <topic>
+
+Read options (consume mode):
+  -n <count>           Print up to <count> recent messages total, then exit.
+                       Default: $DEFAULT_COUNT if no start-position flag is given.
+  --since <when>       Start from a timestamp, then exit at the high-water mark.
+                       Accepts any GNU date(1) string:
+                         "30 sec ago", "1 min ago", "2 hours ago"
+                         "yesterday 09:00"
+                         "2026-04-21 14:00 UTC"
+  --from-beginning     Replay from the earliest offset (entire retention window).
+                       Rare; use sparingly on high-volume topics.
+  -f, --follow         After the initial read, keep following new messages
+                       (don't exit at the high-water mark). Matches \`tail -f\`.
+  -J, --json           Emit kcat's JSON envelope per message (topic, partition,
+                       offset, timestamp, key, payload) instead of raw payload.
+                       Useful for debugging; changes output shape.
+
+At most one of -n, --since, --from-beginning may be given.
+
+Write options:
+  --produce            Produce mode: read stdin, send one message per line.
+                       Read options are silently ignored in this mode.
+
+Connection options:
+  --broker <host>      Kafka broker (required). Default: \$KAFKA_BROKER.
+  --via <user@host>    SSH jump host. Opens a SOCKS5 tunnel and runs kcat
+                       through proxychains4. Requires proxychains4 + ssh locally.
+                       Default: \$KAFKA_CLI_VIA.
+  --socks-port <port>  Local SOCKS port for --via.
+                       Default: \$KAFKA_CLI_SOCKS_PORT or $DEFAULT_SOCKS_PORT.
+
+Other:
+  --consume            Force consume mode (default).
+  -h, --help           Show this help.
+  -V, --version        Print version and exit.
+
+Environment variables (equivalent to the corresponding flag; flag wins):
+  KAFKA_BROKER, KAFKA_CLI_VIA, KAFKA_CLI_SOCKS_PORT
+
+Note: -n uses kcat's -c flag to hard-cap the total message count across all
+partitions (accurate). --since and --from-beginning select starting position
+per partition and do NOT cap output — on actively-produced topics they may
+not exit cleanly at the high-water mark. Add -f to stream, or pipe through
+\`head -n <N>\` to bound output size.
+
+Examples:
+  kafka-cli my-topic                                       # last 10 + exit
+  kafka-cli -n 100 my-topic                                # last 100 + exit
+  kafka-cli -f my-topic                                    # last 10 + follow
+  kafka-cli -n 100 -f my-topic                             # last 100 + follow
+  kafka-cli --since "5 min ago" my-topic                   # backfill + exit
+  kafka-cli --since "5 min ago" -f my-topic                # backfill + follow
+  kafka-cli --via user@jump.example.com my-topic           # via SSH jump
+  echo '{"foo":1}' | kafka-cli --produce my-topic          # send one message
+  kafka-cli --produce my-topic < payloads.jsonl            # send a file
+
+See docs/MANUAL.md for setup and the SSH-jump / SOCKS proxy walkthrough.
+EOF
+}
+
+die() {
+    # Strip control characters so a hostile env value (e.g. KAFKA_CLI_VIA
+    # containing ANSI escape sequences) can't inject into a terminal reading
+    # stderr when its value is echoed back in the error message.
+    local msg="$*"
+    printf 'kafka-cli: %s\n' "${msg//[[:cntrl:]]/?}" >&2
+    exit 2
+}
+need_arg() { [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a non-empty value"; }
+
+parse_args() {
+    BROKER="${KAFKA_BROKER:-}"
+    VIA="${KAFKA_CLI_VIA:-}"
+    SOCKS_PORT="${KAFKA_CLI_SOCKS_PORT:-$DEFAULT_SOCKS_PORT}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n)                need_arg "$@"; COUNT="$2"; shift 2 ;;
+            -f|--follow)       FOLLOW=1; shift ;;
+            -J|--json)         JSON=1; shift ;;
+            --since)           need_arg "$@"; SINCE="$2"; shift 2 ;;
+            --from-beginning)  FROM_BEGINNING=1; shift ;;
+            --broker)          need_arg "$@"; BROKER="$2"; shift 2 ;;
+            --via)             need_arg "$@"; VIA="$2"; shift 2 ;;
+            --socks-port)      need_arg "$@"; SOCKS_PORT="$2"; shift 2 ;;
+            --produce)         MODE="produce"; shift ;;
+            --consume)         MODE="consume"; shift ;;
+            -h|--help)         usage; exit 0 ;;
+            -V|--version)      echo "kafka-cli $VERSION"; exit 0 ;;
+            --)                shift; break ;;
+            -*)                die "unknown option: $1 (try --help)" ;;
+            *)
+                [[ -z "$TOPIC" ]] || die "unexpected argument: $1 (topic already '$TOPIC')"
+                TOPIC="$1"; shift ;;
+        esac
+    done
+
+    # After `--`, any remaining args are positional.
+    while [[ $# -gt 0 ]]; do
+        [[ -z "$TOPIC" ]] || die "unexpected argument: $1 (topic already '$TOPIC')"
+        TOPIC="$1"; shift
+    done
+
+    [[ -n "$TOPIC" ]] || { usage >&2; die "topic is required"; }
+    [[ -n "${BROKER//[[:space:]]/}" ]] \
+        || die "no broker configured — set \$KAFKA_BROKER or pass --broker <host>."
+    # Guard against $VIA / $BROKER being interpreted as flags by ssh / kcat.
+    [[ "$VIA" != -* ]] \
+        || die "--via / \$KAFKA_CLI_VIA value must not start with '-' (got: '$VIA')."
+    [[ "$BROKER" != -* ]] \
+        || die "--broker / \$KAFKA_BROKER value must not start with '-' (got: '$BROKER')."
+}
+
+build_kcat_args() {
+    case "$MODE" in
+        consume)
+            local start_flags=0
+            [[ -n "$COUNT" ]]    && (( start_flags += 1 ))
+            [[ -n "$SINCE" ]]    && (( start_flags += 1 ))
+            (( FROM_BEGINNING )) && (( start_flags += 1 ))
+            (( start_flags <= 1 )) \
+                || die "use at most one of -n, --since, --from-beginning."
+
+            local offset
+            if (( FROM_BEGINNING )); then
+                offset="beginning"
+            elif [[ -n "$SINCE" ]]; then
+                local date_cmd
+                # GNU date supports -d; BSD date (macOS default) does not.
+                # On macOS, `brew install coreutils` ships a `gdate` binary.
+                if date -d '@0' >/dev/null 2>&1; then
+                    date_cmd=date
+                elif command -v gdate >/dev/null 2>&1; then
+                    date_cmd=gdate
+                else
+                    die "--since requires GNU date. macOS: brew install coreutils."
+                fi
+                local ts
+                ts=$("$date_cmd" -d "$SINCE" +%s%3N 2>/dev/null) \
+                    || die "cannot parse --since: $SINCE (examples: '5 min ago', 'yesterday 09:00')"
+                offset="s@$ts"
+            else
+                COUNT="${COUNT:-$DEFAULT_COUNT}"
+                [[ "$COUNT" =~ ^[1-9][0-9]*$ ]] \
+                    || die "-n requires a positive integer (got: $COUNT)"
+                offset="-$COUNT"
+            fi
+
+            KCAT_ARGS=(-b "$BROKER" -t "$TOPIC" -C -q -o "$offset")
+            (( JSON )) && KCAT_ARGS+=(-J)
+            if ! (( FOLLOW )); then
+                KCAT_ARGS+=(-e)
+                # -c caps total messages. Needed for -n because on actively-produced
+                # topics kcat's -e never fires (the HWM moves faster than we drain).
+                # Not set for --since / --from-beginning — their intended count is
+                # unknown; rely on -e there and accept it may be unreliable.
+                [[ -n "$COUNT" ]] && KCAT_ARGS+=(-c "$COUNT")
+            fi
+            ;;
+        produce)
+            # Produce mode silently ignores read-side flags (-n, -f, --since,
+            # --from-beginning). -P = producer, -l = newline-delimited stdin.
+            KCAT_ARGS=(-b "$BROKER" -t "$TOPIC" -P -l)
+            ;;
+    esac
+}
+
+cleanup_tunnel() {
+    if [[ -n "$SSH_PID" ]] && kill -0 "$SSH_PID" 2>/dev/null; then
+        kill "$SSH_PID" 2>/dev/null || true
+        wait "$SSH_PID" 2>/dev/null || true
+    fi
+    [[ -n "$PCHAIN_CONF" ]] && rm -f "$PCHAIN_CONF"
+}
+
+run_via_tunnel() {
+    # 10# forces base-10 so values like "0080" aren't parsed as octal.
+    [[ "$SOCKS_PORT" =~ ^[0-9]+$ ]] && (( 10#$SOCKS_PORT >= 1 && 10#$SOCKS_PORT <= 65535 )) \
+        || die "--socks-port must be an integer in 1..65535 (got: $SOCKS_PORT)."
+    # Normalize to decimal so ssh / proxychains see the same canonical port.
+    SOCKS_PORT=$((10#$SOCKS_PORT))
+    command -v proxychains4 >/dev/null \
+        || die "proxychains4 required for --via. install with 'sudo apt install proxychains4'."
+    command -v ssh >/dev/null || die "ssh required for --via."
+
+    PCHAIN_CONF=$(mktemp "${TMPDIR:-/tmp}/kafka-cli-proxychains.XXXXXX")
+    # EXIT runs cleanup on any exit path. INT/TERM/HUP explicitly exit so that
+    # a signal during the readiness loop doesn't just kill SSH and resume — it
+    # cleanly tears down and propagates the conventional signal exit code.
+    trap cleanup_tunnel EXIT
+    trap 'exit 130' INT TERM HUP
+
+    cat > "$PCHAIN_CONF" <<EOF
+strict_chain
+proxy_dns
+tcp_read_time_out 15000
+tcp_connect_time_out 8000
+[ProxyList]
+socks5 127.0.0.1 $SOCKS_PORT
+EOF
+
+    ssh -N -D "$SOCKS_PORT" \
+        -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=3 \
+        "$VIA" &
+    SSH_PID=$!
+
+    # Wait up to ~5s for the SOCKS port to accept connections. Check SSH
+    # liveness before each probe so a tunnel that died (e.g. port already
+    # bound by an unrelated process) doesn't race the probe into success.
+    local ready=0
+    for _ in {1..50}; do
+        kill -0 "$SSH_PID" 2>/dev/null \
+            || die "SSH tunnel to $VIA exited before the SOCKS port came up."
+        if (exec 3<>/dev/tcp/127.0.0.1/"$SOCKS_PORT") 2>/dev/null; then
+            ready=1
+            break
+        fi
+        sleep 0.1
+    done
+    kill -0 "$SSH_PID" 2>/dev/null \
+        || die "SSH tunnel to $VIA exited before the SOCKS port came up."
+    (( ready )) || die "timed out waiting for SOCKS port $SOCKS_PORT on $VIA."
+
+    # Do NOT exec — the EXIT trap needs to fire to tear the tunnel down.
+    proxychains4 -q -f "$PCHAIN_CONF" kcat "${KCAT_ARGS[@]}"
+}
+
+main() {
+    parse_args "$@"
+
+    command -v kcat >/dev/null \
+        || die "kcat not found on PATH. install with 'sudo apt install kcat' or 'brew install kcat'."
+
+    build_kcat_args
+
+    if [[ -n "${VIA//[[:space:]]/}" ]]; then
+        run_via_tunnel
+    else
+        # No tunnel; safe to exec.
+        exec kcat "${KCAT_ARGS[@]}"
+    fi
+}
+
+main "$@"
