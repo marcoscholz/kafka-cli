@@ -34,8 +34,10 @@ jobs:
         run: shellcheck bin/kafka-cli
 
       - name: no trailing whitespace
+        # Scope to every git-tracked file via ls-files so newly-added dirs
+        # (tests/, examples/, …) are covered automatically. -I skips binaries.
         run: |
-          hits=$(grep -rnP ' +$' bin docs README.md CHANGELOG.md .github/workflows 2>/dev/null || true)
+          hits=$(git ls-files -z | xargs -0 grep -HnIP ' +$' 2>/dev/null || true)
           if [[ -n "$hits" ]]; then
               echo "::error::Trailing whitespace found:"
               echo "$hits"
@@ -44,7 +46,7 @@ jobs:
 
       - name: LF line endings only
         run: |
-          hits=$(grep -rlI $'\r' bin docs README.md CHANGELOG.md .github/workflows 2>/dev/null || true)
+          hits=$(git ls-files -z | xargs -0 grep -lI $'\r' 2>/dev/null || true)
           if [[ -n "$hits" ]]; then
               echo "::error::CRLF line endings found in:"
               echo "$hits"
@@ -54,6 +56,10 @@ jobs:
       - name: bin/kafka-cli tracked as executable
         run: |
           mode=$(git ls-files --stage bin/kafka-cli | awk '{print $1}')
+          if [[ -z "$mode" ]]; then
+              echo "::error::bin/kafka-cli is not tracked in git"
+              exit 1
+          fi
           if [[ "$mode" != "100755" ]]; then
               echo "::error::bin/kafka-cli must be tracked as 100755 (got: $mode)"
               exit 1
