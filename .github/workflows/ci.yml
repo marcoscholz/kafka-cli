@@ -1,10 +1,16 @@
-# PR-time validation: bash syntax check + shellcheck lint.
+# PR-time validation. Failures block merge (once branch protection is on).
 #
-# Runs on every pull request and on pushes to main. A failure blocks merge
-# (once branch protection is configured) and gives you a chance to fix the
-# PR before it lands - so release-time lint failures become a rarity.
+# Checks, in order of runtime cost (cheap -> slow):
+#   1. bash syntax
+#   2. shellcheck lint
+#   3. no trailing whitespace / merge markers
+#   4. LF line endings only
+#   5. bin/kafka-cli tracked as 100755
+#   6. smoke test: --help and --version exit 0
+#   7. workflow YAML validity
+#   8. secret scan (gitleaks, full history)
 #
-# Shellcheck is pre-installed on ubuntu-latest runners; no apt-install step.
+# Shellcheck and PyYAML are pre-installed on ubuntu-latest runners.
 
 name: ci
 
@@ -18,9 +24,59 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # gitleaks scans all commits
 
       - name: bash syntax check
         run: bash -n bin/kafka-cli
 
       - name: shellcheck
         run: shellcheck bin/kafka-cli
+
+      - name: no trailing whitespace
+        run: |
+          hits=$(grep -rnP ' +$' bin docs README.md CHANGELOG.md .github/workflows 2>/dev/null || true)
+          if [[ -n "$hits" ]]; then
+              echo "::error::Trailing whitespace found:"
+              echo "$hits"
+              exit 1
+          fi
+
+      - name: LF line endings only
+        run: |
+          hits=$(grep -rlI $'\r' bin docs README.md CHANGELOG.md .github/workflows 2>/dev/null || true)
+          if [[ -n "$hits" ]]; then
+              echo "::error::CRLF line endings found in:"
+              echo "$hits"
+              exit 1
+          fi
+
+      - name: bin/kafka-cli tracked as executable
+        run: |
+          mode=$(git ls-files --stage bin/kafka-cli | awk '{print $1}')
+          if [[ "$mode" != "100755" ]]; then
+              echo "::error::bin/kafka-cli must be tracked as 100755 (got: $mode)"
+              exit 1
+          fi
+
+      - name: smoke test
+        run: |
+          bash bin/kafka-cli --help > /dev/null
+          bash bin/kafka-cli --version
+
+      - name: workflow YAML validity
+        run: |
+          python3 -c '
+          import yaml, pathlib
+          for p in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
+              yaml.safe_load(p.read_text())
+              print(f"ok: {p}")
+          '
+
+      - name: scan for secrets (gitleaks)
+        run: |
+          VERSION=8.21.2
+          curl -fsSL -o /tmp/gitleaks.tar.gz \
+              "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          /tmp/gitleaks detect --no-banner --exit-code=1
