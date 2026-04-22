@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-04-22
+
+### Fixed
+
+- Release workflow failed on v1.0.0 because the shellcheck lint gate hit two findings (`SC2209`, `SC2015`) in `bin/kafka-cli`. Rewrote the offending lines; the behaviour is identical.
+- Bumped `actions/checkout` from `@v4` (Node.js 20, deprecated) to `@v5` (Node.js 24).
+
+### Added
+
+- `.github/workflows/ci.yml` + `test/ci.sh`: PR-time validation running bash syntax, shellcheck, trailing-whitespace, CRLF, executable-bit, smoke test (`--help` / `--version`), workflow-YAML validity, and gitleaks secret scan. All checks are reproducible locally via `./test/ci.sh`.
+
 ## [1.0.0] - 2026-04-22
 
 ### Added

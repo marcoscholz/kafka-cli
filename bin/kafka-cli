@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 DEFAULT_COUNT="10"
 DEFAULT_SOCKS_PORT="10808"
 
@@ -166,9 +166,9 @@ build_kcat_args() {
                 # GNU date supports -d; BSD date (macOS default) does not.
                 # On macOS, `brew install coreutils` ships a `gdate` binary.
                 if date -d '@0' >/dev/null 2>&1; then
-                    date_cmd=date
+                    date_cmd="date"
                 elif command -v gdate >/dev/null 2>&1; then
-                    date_cmd=gdate
+                    date_cmd="gdate"
                 else
                     die "--since requires GNU date. macOS: brew install coreutils."
                 fi
@@ -212,8 +212,10 @@ cleanup_tunnel() {
 
 run_via_tunnel() {
     # 10# forces base-10 so values like "0080" aren't parsed as octal.
-    [[ "$SOCKS_PORT" =~ ^[0-9]+$ ]] && (( 10#$SOCKS_PORT >= 1 && 10#$SOCKS_PORT <= 65535 )) \
-        || die "--socks-port must be an integer in 1..65535 (got: $SOCKS_PORT)."
+    if ! [[ "$SOCKS_PORT" =~ ^[0-9]+$ ]] \
+       || (( 10#$SOCKS_PORT < 1 || 10#$SOCKS_PORT > 65535 )); then
+        die "--socks-port must be an integer in 1..65535 (got: $SOCKS_PORT)."
+    fi
     # Normalize to decimal so ssh / proxychains see the same canonical port.
     SOCKS_PORT=$((10#$SOCKS_PORT))
     command -v proxychains4 >/dev/null \

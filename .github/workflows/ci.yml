@@ -1,0 +1,44 @@
+# PR-time validation. Failures block merge (once branch protection is on).
+#
+# All check logic lives in test/ci.sh — run `./test/ci.sh` locally to
+# reproduce exactly what CI does. Each step here calls one subcommand
+# so GitHub Actions shows per-check status in the UI.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # gitleaks scans the full history
+
+      - name: bash syntax
+        run: ./test/ci.sh syntax
+
+      - name: shellcheck
+        run: ./test/ci.sh shellcheck
+
+      - name: trailing whitespace
+        run: ./test/ci.sh whitespace
+
+      - name: LF line endings
+        run: ./test/ci.sh crlf
+
+      - name: executable bit
+        run: ./test/ci.sh exec-bit
+
+      - name: smoke test
+        run: ./test/ci.sh smoke
+
+      - name: workflow YAML validity
+        run: ./test/ci.sh yaml
+
+      - name: gitleaks secret scan
+        run: ./test/ci.sh gitleaks
