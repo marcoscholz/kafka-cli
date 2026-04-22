@@ -1,49 +1,38 @@
-# Attaches assets + verify-download snippet to a GitHub Release the moment
-# it's published from the UI (or via `gh release create`).
+# Cut a release by pushing a tag matching v*.*.*:
+#
+#   git tag -a v1.0.2 -m "..." && git push origin v1.0.2
+#
+# Or via GitHub: Tags page → New tag. **Do not** use Releases → New
+# release: that publishes the release immediately, which makes it
+# immutable (if the repo ruleset is set), at which point this workflow
+# can't attach assets to it.
 #
 # Flow:
-#   1. You draft a release in the UI, pick/create tag v1.0.0, click Publish.
-#   2. GitHub fires `release: published`.
-#   3. This workflow:
-#        a. Checks out the tagged commit
-#        b. Lints bin/kafka-cli with shellcheck
-#        c. Computes SHA-256 of the script
-#        d. Uploads bin/kafka-cli and bin/kafka-cli.sha256 as release assets
-#        e. Updates the release notes:
-#             - if you left the body empty, it inserts the matching CHANGELOG
-#               section
-#             - if you wrote your own, it's preserved and the verify-download
-#               snippet is appended at the bottom
-#
-# If the workflow fails (e.g. shellcheck finds a regression), the release
-# already exists but has no assets — so it's worth wiring a PR-time
-# shellcheck check separately so you catch this before publishing.
+#   1. Lint bin/kafka-cli (defence-in-depth — PR gate already ran it).
+#   2. Compute SHA-256 of the script.
+#   3. Extract the matching section from CHANGELOG.md.
+#   4. Create a DRAFT release with the script + .sha256 attached.
+#      Drafts remain mutable under the immutable-releases ruleset, so
+#      the uploads are free to land.
+#   5. Publish the draft (this is the transition to immutable).
 
 name: release
 
 on:
-  release:
-    types: [published]
-
-# Defence-in-depth: only run when the tag matches v*.*.*. The workflow
-# still publishes hashes on valid releases; arbitrary-tag releases are
-# ignored rather than producing empty or mis-targeted notes.
+  push:
+    tags:
+      - 'v*.*.*'
 
 permissions:
-  contents: write  # needed to upload assets and edit release notes
+  contents: write  # required to create the Release
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    if: startsWith(github.event.release.tag_name, 'v')
     steps:
       - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.release.tag_name }}
 
       - name: Lint script
-        # Defence-in-depth: CI should have caught this on the PR. If it
-        # reaches here, the release is halted before assets are uploaded.
         run: shellcheck bin/kafka-cli
 
       - name: Compute SHA-256
@@ -55,34 +44,20 @@ jobs:
 
       - name: Build release notes
         env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.ref_name }}
           SHA: ${{ steps.hash.outputs.sum }}
         run: |
           VERSION="${TAG#v}"
+          # Literal-string match via index() avoids regex metachars in $VERSION.
+          awk -v header="## [$VERSION]" '
+              index($0, header) == 1   { printing=1; next }
+              printing && /^## \[/     { exit }
+              printing                 { print }
+          ' CHANGELOG.md > release-notes.md
 
-          # If the user didn't write notes in the UI, seed them from CHANGELOG.
-          # `.body // ""` coerces a missing body (returned as JSON null) to an
-          # empty string so the branch below fires.
-          existing=$(gh release view "$TAG" --json body --jq '.body // ""')
-          if [[ -z "$existing" ]]; then
-              # Literal-string match via index() — avoids regex metachars in
-              # $VERSION (`.`, `*`) matching unintended sections.
-              awk -v header="## [$VERSION]" '
-                  index($0, header) == 1   { printing=1; next }
-                  printing && /^## \[/     { exit }
-                  printing                 { print }
-              ' CHANGELOG.md > release-notes.md
+          [[ -s release-notes.md ]] \
+              || { echo "ERROR: CHANGELOG section for $VERSION not found." >&2; exit 1; }
 
-              # Fail loudly if the CHANGELOG section is missing so we don't
-              # silently publish a release with only a hash block.
-              [[ -s release-notes.md ]] \
-                  || { echo "ERROR: CHANGELOG section for $VERSION not found." >&2; exit 1; }
-          else
-              printf '%s\n' "$existing" > release-notes.md
-          fi
-
-          # Always append the verify-download section with the real hash.
           cat >> release-notes.md <<EOF
 
           ---
@@ -95,13 +70,20 @@ jobs:
           \`\`\`
           EOF
 
-      - name: Upload assets and update release notes
+      - name: Create draft release with assets
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.ref_name }}
         run: |
-          gh release upload "$TAG" \
+          gh release create "$TAG" \
+              --draft \
+              --title "$TAG" \
+              --notes-file release-notes.md \
               bin/kafka-cli \
-              bin/kafka-cli.sha256 \
-              --clobber
-          gh release edit "$TAG" --notes-file release-notes.md
+              bin/kafka-cli.sha256
+
+      - name: Publish release (transitions to immutable)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --draft=false
