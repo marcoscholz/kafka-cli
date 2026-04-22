@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 DEFAULT_COUNT="10"
 DEFAULT_SOCKS_PORT="10808"
 
