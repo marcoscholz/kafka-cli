@@ -28,7 +28,7 @@ curl -fsSL "$KAFKA_CLI" -o ~/.local/bin/kafka-cli
 chmod +x ~/.local/bin/kafka-cli
 ````
 
-To always track the latest release, swap `v1.0.0` for `main` in the URL.
+To always track the latest commit on main, swap the version tag for `main` in the URL.
 To verify the download, compare the SHA-256 against the value published on
 the [Releases page](https://github.com/marcoscholz/kafka-cli/releases):
 ````bash
