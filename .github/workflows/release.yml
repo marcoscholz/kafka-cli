@@ -25,12 +25,17 @@ on:
   release:
     types: [published]
 
+# Defence-in-depth: only run when the tag matches v*.*.*. The workflow
+# still publishes hashes on valid releases; arbitrary-tag releases are
+# ignored rather than producing empty or mis-targeted notes.
+
 permissions:
   contents: write  # needed to upload assets and edit release notes
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    if: startsWith(github.event.release.tag_name, 'v')
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,13 +63,22 @@ jobs:
           VERSION="${TAG#v}"
 
           # If the user didn't write notes in the UI, seed them from CHANGELOG.
-          existing=$(gh release view "$TAG" --json body --jq .body)
+          # `.body // ""` coerces a missing body (returned as JSON null) to an
+          # empty string so the branch below fires.
+          existing=$(gh release view "$TAG" --json body --jq '.body // ""')
           if [[ -z "$existing" ]]; then
-              awk -v ver="$VERSION" '
-                  $0 ~ "^## \\["ver"\\]" { printing=1; next }
-                  printing && /^## \[/    { exit }
-                  printing                { print }
+              # Literal-string match via index() — avoids regex metachars in
+              # $VERSION (`.`, `*`) matching unintended sections.
+              awk -v header="## [$VERSION]" '
+                  index($0, header) == 1   { printing=1; next }
+                  printing && /^## \[/     { exit }
+                  printing                 { print }
               ' CHANGELOG.md > release-notes.md
+
+              # Fail loudly if the CHANGELOG section is missing so we don't
+              # silently publish a release with only a hash block.
+              [[ -s release-notes.md ]] \
+                  || { echo "ERROR: CHANGELOG section for $VERSION not found." >&2; exit 1; }
           else
               printf '%s\n' "$existing" > release-notes.md
           fi
