@@ -1,16 +1,8 @@
 # PR-time validation. Failures block merge (once branch protection is on).
 #
-# Checks, in order of runtime cost (cheap -> slow):
-#   1. bash syntax
-#   2. shellcheck lint
-#   3. no trailing whitespace / merge markers
-#   4. LF line endings only
-#   5. bin/kafka-cli tracked as 100755
-#   6. smoke test: --help and --version exit 0
-#   7. workflow YAML validity
-#   8. secret scan (gitleaks, full history)
-#
-# Shellcheck and PyYAML are pre-installed on ubuntu-latest runners.
+# All check logic lives in test/ci.sh — run `./test/ci.sh` locally to
+# reproduce exactly what CI does. Each step here calls one subcommand
+# so GitHub Actions shows per-check status in the UI.
 
 name: ci
 
@@ -25,64 +17,28 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0  # gitleaks scans all commits
+          fetch-depth: 0  # gitleaks scans the full history
 
-      - name: bash syntax check
-        run: bash -n bin/kafka-cli
+      - name: bash syntax
+        run: ./test/ci.sh syntax
 
       - name: shellcheck
-        run: shellcheck bin/kafka-cli
+        run: ./test/ci.sh shellcheck
 
-      - name: no trailing whitespace
-        # Scope to every git-tracked file via ls-files so newly-added dirs
-        # (tests/, examples/, …) are covered automatically. -I skips binaries.
-        run: |
-          hits=$(git ls-files -z | xargs -0 grep -HnIP ' +$' 2>/dev/null || true)
-          if [[ -n "$hits" ]]; then
-              echo "::error::Trailing whitespace found:"
-              echo "$hits"
-              exit 1
-          fi
+      - name: trailing whitespace
+        run: ./test/ci.sh whitespace
 
-      - name: LF line endings only
-        run: |
-          hits=$(git ls-files -z | xargs -0 grep -lI $'\r' 2>/dev/null || true)
-          if [[ -n "$hits" ]]; then
-              echo "::error::CRLF line endings found in:"
-              echo "$hits"
-              exit 1
-          fi
+      - name: LF line endings
+        run: ./test/ci.sh crlf
 
-      - name: bin/kafka-cli tracked as executable
-        run: |
-          mode=$(git ls-files --stage bin/kafka-cli | awk '{print $1}')
-          if [[ -z "$mode" ]]; then
-              echo "::error::bin/kafka-cli is not tracked in git"
-              exit 1
-          fi
-          if [[ "$mode" != "100755" ]]; then
-              echo "::error::bin/kafka-cli must be tracked as 100755 (got: $mode)"
-              exit 1
-          fi
+      - name: executable bit
+        run: ./test/ci.sh exec-bit
 
       - name: smoke test
-        run: |
-          bash bin/kafka-cli --help > /dev/null
-          bash bin/kafka-cli --version
+        run: ./test/ci.sh smoke
 
       - name: workflow YAML validity
-        run: |
-          python3 -c '
-          import yaml, pathlib
-          for p in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
-              yaml.safe_load(p.read_text())
-              print(f"ok: {p}")
-          '
+        run: ./test/ci.sh yaml
 
-      - name: scan for secrets (gitleaks)
-        run: |
-          VERSION=8.21.2
-          curl -fsSL -o /tmp/gitleaks.tar.gz \
-              "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
-          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
-          /tmp/gitleaks detect --no-banner --exit-code=1
+      - name: gitleaks secret scan
+        run: ./test/ci.sh gitleaks
