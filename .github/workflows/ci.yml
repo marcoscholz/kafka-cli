@@ -1,0 +1,26 @@
+# PR-time validation: bash syntax check + shellcheck lint.
+#
+# Runs on every pull request and on pushes to main. A failure blocks merge
+# (once branch protection is configured) and gives you a chance to fix the
+# PR before it lands - so release-time lint failures become a rarity.
+#
+# Shellcheck is pre-installed on ubuntu-latest runners; no apt-install step.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: bash syntax check
+        run: bash -n bin/kafka-cli
+
+      - name: shellcheck
+        run: shellcheck bin/kafka-cli

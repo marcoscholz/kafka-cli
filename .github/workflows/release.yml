@@ -42,10 +42,9 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
 
       - name: Lint script
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
-          shellcheck bin/kafka-cli
+        # Defence-in-depth: CI should have caught this on the PR. If it
+        # reaches here, the release is halted before assets are uploaded.
+        run: shellcheck bin/kafka-cli
 
       - name: Compute SHA-256
         id: hash
