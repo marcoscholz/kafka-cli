@@ -1,31 +1,40 @@
-# Publishes a GitHub Release whenever a tag matching v*.*.* is pushed.
+# Attaches assets + verify-download snippet to a GitHub Release the moment
+# it's published from the UI (or via `gh release create`).
 #
-# What it does:
-#   1. Lints bin/kafka-cli with shellcheck (fails the release if linting fails).
-#   2. Computes the SHA-256 of bin/kafka-cli.
-#   3. Extracts the matching section from CHANGELOG.md as release notes.
-#   4. Creates the GitHub Release with:
-#        - bin/kafka-cli         (the downloadable script)
-#        - bin/kafka-cli.sha256  (sha256sum -c compatible checksum file)
-#        - release notes = changelog section + verify-download snippet
+# Flow:
+#   1. You draft a release in the UI, pick/create tag v1.0.0, click Publish.
+#   2. GitHub fires `release: published`.
+#   3. This workflow:
+#        a. Checks out the tagged commit
+#        b. Lints bin/kafka-cli with shellcheck
+#        c. Computes SHA-256 of the script
+#        d. Uploads bin/kafka-cli and bin/kafka-cli.sha256 as release assets
+#        e. Updates the release notes:
+#             - if you left the body empty, it inserts the matching CHANGELOG
+#               section
+#             - if you wrote your own, it's preserved and the verify-download
+#               snippet is appended at the bottom
 #
-# To cut a release:   git tag -a v1.0.0 -m "…"   &&   git push origin v1.0.0
+# If the workflow fails (e.g. shellcheck finds a regression), the release
+# already exists but has no assets — so it's worth wiring a PR-time
+# shellcheck check separately so you catch this before publishing.
 
 name: release
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  release:
+    types: [published]
 
 permissions:
-  contents: write  # needed to create the Release
+  contents: write  # needed to upload assets and edit release notes
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
 
       - name: Lint script
         run: |
@@ -40,18 +49,27 @@ jobs:
           sha256sum kafka-cli > kafka-cli.sha256
           echo "sum=$(cut -d' ' -f1 kafka-cli.sha256)" >> "$GITHUB_OUTPUT"
 
-      - name: Extract changelog section
+      - name: Build release notes
         env:
-          REF_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
           SHA: ${{ steps.hash.outputs.sum }}
         run: |
-          VERSION="${REF_NAME#v}"
-          awk -v ver="$VERSION" '
-              $0 ~ "^## \\["ver"\\]" { printing=1; next }
-              printing && /^## \[/    { exit }
-              printing                { print }
-          ' CHANGELOG.md > release-notes.md
+          VERSION="${TAG#v}"
 
+          # If the user didn't write notes in the UI, seed them from CHANGELOG.
+          existing=$(gh release view "$TAG" --json body --jq .body)
+          if [[ -z "$existing" ]]; then
+              awk -v ver="$VERSION" '
+                  $0 ~ "^## \\["ver"\\]" { printing=1; next }
+                  printing && /^## \[/    { exit }
+                  printing                { print }
+              ' CHANGELOG.md > release-notes.md
+          else
+              printf '%s\n' "$existing" > release-notes.md
+          fi
+
+          # Always append the verify-download section with the real hash.
           cat >> release-notes.md <<EOF
 
           ---
@@ -64,13 +82,13 @@ jobs:
           \`\`\`
           EOF
 
-      - name: Create GitHub Release
+      - name: Upload assets and update release notes
         env:
           GH_TOKEN: ${{ github.token }}
-          REF_NAME: ${{ github.ref_name }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          gh release create "$REF_NAME" \
-              --title "$REF_NAME" \
-              --notes-file release-notes.md \
+          gh release upload "$TAG" \
               bin/kafka-cli \
-              bin/kafka-cli.sha256
+              bin/kafka-cli.sha256 \
+              --clobber
+          gh release edit "$TAG" --notes-file release-notes.md
