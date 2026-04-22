@@ -22,7 +22,7 @@ brew install kcat proxychains-ng
 
 Install the script to your bin folder:
 ````bash
-KAFKA_CLI="https://raw.githubusercontent.com/marcoscholz/kafka-cli/v1.0.1/bin/kafka-cli"
+KAFKA_CLI="https://raw.githubusercontent.com/marcoscholz/kafka-cli/v1.0.2/bin/kafka-cli"
 mkdir -p ~/.local/bin
 curl -fsSL "$KAFKA_CLI" -o ~/.local/bin/kafka-cli
 chmod +x ~/.local/bin/kafka-cli
